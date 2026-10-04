@@ -1,0 +1,133 @@
+name: Linux RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Update system
+        run: |
+          sudo apt update
+
+      - name: Install Desktop and XRDP
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+            xfce4 \
+            xfce4-goodies \
+            xfce4-session \
+            xfce4-panel \
+            xfce4-settings \
+            dbus-x11 \
+            xorgxrdp \
+            xrdp
+
+      - name: Create RDP User
+        run: |
+          sudo useradd -m -s /bin/bash rdpuser 2>/dev/null || true
+          sudo passwd -u rdpuser || true
+          echo 'rdpuser:LinuxRDP2026A' | sudo chpasswd
+          sudo usermod -s /bin/bash rdpuser
+          sudo usermod -aG sudo rdpuser
+
+          sudo mkdir -p /home/rdpuser
+          sudo chown -R rdpuser:rdpuser /home/rdpuser
+
+          echo "User status:"
+          sudo passwd -S rdpuser
+
+      - name: Configure XFCE Session
+        run: |
+          echo "startxfce4" | sudo tee /home/rdpuser/.xsession
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          sudo chmod +x /home/rdpuser/.xsession
+
+          sudo mkdir -p /home/rdpuser/.config
+          sudo chown -R rdpuser:rdpuser /home/rdpuser/.config
+
+          sudo bash -c 'cat > /etc/xrdp/startwm.sh << "EOF"
+          #!/bin/sh
+
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
+
+          exec dbus-launch --exit-with-session startxfce4
+          EOF'
+
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+      - name: Configure XRDP
+        run: |
+          sudo adduser xrdp ssl-cert || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          sleep 5
+          sudo systemctl status xrdp --no-pager
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale
+        run: |
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "TAILSCALE_AUTH_KEY secret is missing."
+            exit 1
+          fi
+
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="gh-linux-rdp-${GITHUB_RUN_ID}"
+
+          sleep 5
+
+          TS_IP=$(tailscale ip -4 | head -n 1)
+
+          if [ -z "$TS_IP" ]; then
+            echo "Failed to get Tailscale IPv4 address."
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          echo "================================"
+          echo "TAILSCALE IP: $TS_IP"
+          echo "================================"
+
+      - name: Verify XRDP
+        run: |
+          sudo systemctl status xrdp --no-pager
+
+          if ! sudo ss -ltnp | grep -q ':3389'; then
+            echo "XRDP is not listening on port 3389."
+            exit 1
+          fi
+
+          echo "XRDP is listening on port 3389."
+
+      - name: Show Login Info
+        run: |
+          echo "================================"
+          echo "LINUX RDP READY"
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdpuser"
+          echo "Password: LinuxRDP2026A"
+          echo "Session: Xorg"
+          echo "================================"
+
+      - name: Keep Alive
+        run: |
+          while true; do
+            if ! systemctl is-active --quiet xrdp; then
+              sudo systemctl restart xrdp
+            fi
+
+            echo "[$(date)] Linux RDP active - $TAILSCALE_IP"
+            sleep 300
+          done
